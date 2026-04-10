@@ -14,8 +14,8 @@ EMAIL_PORT = 993
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 
-# 邮件主题关键词 -> 卡片名
-CARD_SUBJECTS = {
+# 附件文件名关键词 -> 卡片名
+ATTACHMENT_KEYWORDS = {
     "中课包-用户行为": "中课包-用户行为",
 }
 
@@ -46,14 +46,14 @@ DAILY_MILESTONES = {
              "动作": ["①13:00发送家访邀约话术，邀约时间到21:00", "②群发登录话术节点19:30/20:30"]},
 }
 
-def decode_subject(raw_subject):
-    parts = email.header.decode_header(raw_subject)
+def decode_filename(raw):
+    parts = email.header.decode_header(raw)
     result = ""
     for part, charset in parts:
         if isinstance(part, bytes):
             result += part.decode(charset or "utf-8", errors="replace")
         else:
-            result += part
+            result += str(part)
     return result
 
 def fetch_excel_attachments(days_back=2):
@@ -61,42 +61,31 @@ def fetch_excel_attachments(days_back=2):
     mail = imaplib.IMAP4_SSL(EMAIL_HOST, EMAIL_PORT)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("INBOX")
-    
+
     since_date = (datetime.date.today() - datetime.timedelta(days=days_back)).strftime("%d-%b-%Y")
-    print(f"[搜索] 查找 {since_date} 之后的邮件")
-    
+    print(f"[搜索] {since_date} 之后的邮件")
+
     _, msg_ids = mail.search(None, f"SINCE {since_date}")
     ids = msg_ids[0].split()
-    print(f"[搜索] 找到 {len(ids)} 封邮件")
-    
-    for keyword, subject_cn in CARD_SUBJECTS.items():
-        found_id = None
-        for uid in reversed(ids[-50:]):
-            _, msg_data = mail.fetch(uid, "(BODY[HEADER.FIELDS (SUBJECT)])")
-            raw_header = msg_data[0][1]
-            msg_header = email.message_from_bytes(raw_header)
-            subj = decode_subject(msg_header.get("Subject", ""))
-            print(f"[检查] 主题: {subj}")
-            if subject_cn in subj:
-                found_id = uid
-                print(f"[匹配] 找到: {subj}")
-                break
-        
-        if not found_id:
-            print(f"[警告] 未找到含 {subject_cn} 的邮件")
-            continue
-        
-        _, msg_data = mail.fetch(found_id, "(RFC822)")
+    print(f"[搜索] 共 {len(ids)} 封邮件")
+
+    # 逐封检查附件文件名
+    for uid in reversed(ids[-50:]):
+        _, msg_data = mail.fetch(uid, "(RFC822)")
         msg = email.message_from_bytes(msg_data[0][1])
         for part in msg.walk():
-            fn = part.get_filename() or ""
-            if fn.endswith(".xlsx") or fn.endswith(".xls"):
-                payload = part.get_payload(decode=True)
-                df = pd.read_excel(BytesIO(payload))
-                results[keyword] = {"name": subject_cn, "df": df}
-                print(f"[成功] 读取附件: {fn} ({len(df)}行)")
-                break
-    
+            raw_fn = part.get_filename()
+            if not raw_fn:
+                continue
+            fn = decode_filename(raw_fn)
+            print(f"[附件] {fn}")
+            for keyword, name in ATTACHMENT_KEYWORDS.items():
+                if keyword in fn and (fn.endswith(".xlsx") or fn.endswith(".xls")):
+                    payload = part.get_payload(decode=True)
+                    df = pd.read_excel(BytesIO(payload))
+                    results[keyword] = {"name": name, "df": df}
+                    print(f"[成功] 匹配附件: {fn} ({len(df)}行)")
+
     mail.logout()
     return results
 
@@ -107,7 +96,7 @@ def parse_behavior_df(df):
     period_df = df[df.iloc[:, 0] == latest].copy()
     records = []
     for _, row in period_df.iterrows():
-        r = {"分组": f"{row.get('进校/非进校','')} {row.get('高低龄','')}".strip()}
+        r = {"分组": f"{row.get('进校/非进校', '')} {row.get('高低龄', '')}".strip()}
         for col in ["销售 - 有效好友", "登录率", "课前深访率", "lec1完课率", "lec2完课率", "lec3完课率", "DM单点击率（UV）", "销售好友转化率-营期内"]:
             val = row.get(col, 0) or 0
             if col == "销售 - 有效好友":
@@ -124,18 +113,18 @@ def analyze_with_claude(data, today, open_date):
     milestone = DAILY_MILESTONES.get(weekday, {})
     prompt = f"""你是西瓜创客AI业务线的销售运营分析师。今天是{today.strftime('%m月%d日')}（{weekday}），营期第{campaign_day}天。
 
-数据（最新营期，按进校/非进校 × 高低龄分组）：
+数据（最新营期，按进校/非进校 x 高低龄分组）：
 {json.dumps(data, ensure_ascii=False, indent=2)}
 
-今日核心指标：{milestone.get('指标','')}
-目标 - 渠道：{milestone.get('渠道目标','')} / 进校：{milestone.get('进校目标','')}
+今日核心指标：{milestone.get('指标', '')}
+目标 - 渠道：{milestone.get('渠道目标', '')} / 进校：{milestone.get('进校目标', '')}
 
 今日必做动作：
-{chr(10).join(milestone.get('动作',[]))}
+{chr(10).join(milestone.get('动作', []))}
 
 请生成销售日报（管理者13:00午会前用）：
 1. 一句话说整体进展
-2. 各分组对比目标，⚠️预警（低于目标）或✅达标
+2. 各分组对比目标，加预警标注
 3. 今日必做动作直接列出
 4. 一句重点提示
 
@@ -158,7 +147,7 @@ def main():
     print(f"[开始] {today} 日报生成")
     attachments = fetch_excel_attachments(days_back=2)
     if not attachments:
-        send_to_wecom(f"【AI日报】{today.strftime('%m月%d日')} ⚠️ 未收到BI数据邮件，请手动检查")
+        send_to_wecom(f"【AI日报】{today.strftime('%m月%d日')} 未收到BI数据邮件，请手动检查")
         return
     all_data = {}
     for key, item in attachments.items():
