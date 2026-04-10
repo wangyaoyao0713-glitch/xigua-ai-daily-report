@@ -7,20 +7,20 @@ import datetime
 import requests
 import pandas as pd
 from io import BytesIO
-from anthropic import Anthropic
+from openai import OpenAI
 
 EMAIL_HOST = "imap.exmail.qq.com"
 EMAIL_PORT = 993
 EMAIL_USER = os.environ.get("EMAIL_USER", "")
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "")
 
-# 附件文件名关键词 -> 卡片名
 ATTACHMENT_KEYWORDS = {
     "中课包-用户行为": "中课包-用户行为",
 }
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+API_BASE = "https://aihub.xiguacity.cn/v1"
 
 def get_weekday_label(today):
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周天"]
@@ -61,15 +61,11 @@ def fetch_excel_attachments(days_back=2):
     mail = imaplib.IMAP4_SSL(EMAIL_HOST, EMAIL_PORT)
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("INBOX")
-
     since_date = (datetime.date.today() - datetime.timedelta(days=days_back)).strftime("%d-%b-%Y")
     print(f"[搜索] {since_date} 之后的邮件")
-
     _, msg_ids = mail.search(None, f"SINCE {since_date}")
     ids = msg_ids[0].split()
     print(f"[搜索] 共 {len(ids)} 封邮件")
-
-    # 逐封检查附件文件名
     for uid in reversed(ids[-50:]):
         _, msg_data = mail.fetch(uid, "(RFC822)")
         msg = email.message_from_bytes(msg_data[0][1])
@@ -78,14 +74,13 @@ def fetch_excel_attachments(days_back=2):
             if not raw_fn:
                 continue
             fn = decode_filename(raw_fn)
-            print(f"[附件] {fn}")
             for keyword, name in ATTACHMENT_KEYWORDS.items():
                 if keyword in fn and (fn.endswith(".xlsx") or fn.endswith(".xls")):
-                    payload = part.get_payload(decode=True)
-                    df = pd.read_excel(BytesIO(payload))
-                    results[keyword] = {"name": name, "df": df}
-                    print(f"[成功] 匹配附件: {fn} ({len(df)}行)")
-
+                    if keyword not in results:
+                        payload = part.get_payload(decode=True)
+                        df = pd.read_excel(BytesIO(payload))
+                        results[keyword] = {"name": name, "df": df}
+                        print(f"[成功] 匹配: {fn} ({len(df)}行)")
     mail.logout()
     return results
 
@@ -106,8 +101,8 @@ def parse_behavior_df(df):
         records.append(r)
     return records
 
-def analyze_with_claude(data, today, open_date):
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+def analyze_with_ai(data, today, open_date):
+    client = OpenAI(api_key=API_KEY, base_url=API_BASE)
     weekday = get_weekday_label(today)
     campaign_day = get_campaign_day(open_date, today)
     milestone = DAILY_MILESTONES.get(weekday, {})
@@ -129,12 +124,13 @@ def analyze_with_claude(data, today, open_date):
 4. 一句重点提示
 
 不超过300字，简洁直接。"""
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}]
+    
+    response = client.chat.completions.create(
+        model="claude-3-5-sonnet-20241022",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1000
     )
-    return response.content[0].text
+    return response.choices[0].message.content
 
 def send_to_wecom(content):
     payload = {"msgtype": "text", "text": {"content": content}}
@@ -153,7 +149,7 @@ def main():
     for key, item in attachments.items():
         all_data[item["name"]] = parse_behavior_df(item["df"])
     open_date = today - datetime.timedelta(days=today.weekday() + 2)
-    report = analyze_with_claude(all_data, today, open_date)
+    report = analyze_with_ai(all_data, today, open_date)
     header = f"【AI销售日报】{today.strftime('%m月%d日')} · {get_weekday_label(today)}\n{'='*25}\n"
     send_to_wecom(header + report)
 
